@@ -11,26 +11,23 @@ from lpe.method_utils import *
 from lpe.utils import Transformer
 from lpe.utils import datasets as lpe_datasets
 
+
 def COLD(
     model,
     input_dists,
     target: int,
     temp: float = 1.0,
-    n_samples: int = 2**11, 
-    n_iterations: int = 1000,  
+    n_samples: int = 1024,
+    n_iterations: int = 200, 
     stepsize: float = 0.1,
     noise_schedule: Optional[List[float]] = None,
     noise_schedule_iters: Optional[List[int]] = None,
     fluency_weight: float = 0.5,
     target_weight: float = 0.5,
     topk: int = 5,
-    batch_size: int = 64,
+    batch_size: int = 64, 
     device: Optional[str] = None
 ) -> float:
-    """
-    COLD-style continuous space sampling for low probability estimation.
-    Memory-efficient version with batching and cleanup.
-    """
     if device is None:
         device = model.device
         
@@ -41,14 +38,13 @@ def COLD(
     
     vocab_size = model.embed.d_vocab
     
-  
     all_estimates = []
     n_batches = (n_samples + batch_size - 1) // batch_size
     
     for batch_idx in tqdm(range(n_batches), desc="COLD batches"):
         current_batch_size = min(batch_size, n_samples - batch_idx * batch_size)
         
-  
+       
         contexts = []
         for _ in range(current_batch_size):
             context = []
@@ -62,10 +58,10 @@ def COLD(
         
         contexts = torch.stack(contexts) 
         
-      
+        
         particles = torch.randn(current_batch_size, vocab_size, device=device) * temp
         
-      
+       
         with torch.no_grad():
             x = model.embed(contexts)
             x = x + model.pos_embed(contexts)
@@ -82,18 +78,18 @@ def COLD(
             return noise_schedule[-1]
         
         def energy_function(particles: torch.Tensor) -> torch.Tensor:
-            """Simplified energy function using precomputed model probs"""
-         
+            
+            
             particle_probs = F.softmax(particles / temp, dim=-1)
             
-        
+           
             fluency_loss = F.kl_div(
                 particle_probs.log(), 
                 model_probs, 
                 reduction='none'
             ).sum(-1)
             
-           
+            
             target_logprobs = F.log_softmax(particles, dim=-1)[:, target]
             target_loss = -target_logprobs
             
@@ -103,40 +99,39 @@ def COLD(
         for iteration in range(n_iterations):
             noise_std = get_noise_std(iteration)
             
-        
             particles = particles.detach().requires_grad_(True)
             
             energy = energy_function(particles)
             energy_total = energy.sum()
             
-  
+           
             energy_total.backward()
             gradients = particles.grad.clone()
             
- 
+           
             with torch.no_grad():
                 noise = torch.randn_like(particles) * noise_std
                 particles = particles - stepsize * gradients + noise
             
-    
+           
             particles.grad = None
             
-
+           
             if iteration % 20 == 0:
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-
+ 
         with torch.no_grad():
             final_probs = F.softmax(particles / temp, dim=-1)
             target_probs = final_probs[:, target]
             batch_estimate = target_probs.mean().item()
             all_estimates.append(batch_estimate)
         
-
+       
         del particles, contexts, model_probs, model_logits
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-
+   
     return np.mean(all_estimates)
 
 
@@ -154,6 +149,7 @@ def run_lpe_with_cold():
     targets = pick_random_tokens(gt_freqs, 16, 1e-9, 1e-5)
     acts = gen_activ_samples(model, dist_name, n_samples=2**13, show_progress=True)
 
+    
     methods = ["QLD", "COLD", "ITGIS", "MHIS"]
     estimates = {}
     orig_dists = distribution_registry[dist_name](model.tokenizer, device=model.device).input_dists(n_reps=N_REPS_DICT[dist_name])
@@ -174,17 +170,19 @@ def run_lpe_with_cold():
                     orig_dists, 
                     target, 
                     temp=RECOMMENDED_TEMPS[model_name].get("COLD", {}).get(dist_name, 1.0),
-                    n_samples=512,  
-                    n_iterations=100,
+                    n_samples=512, 
+                    n_iterations=100,  
                     batch_size=32  
                 )
 
+ 
     plt.figure(figsize=(12, 6))
     colors = {'QLD': 'orange', 'ITGIS': 'red', 'COLD': 'blue', 'MHIS': 'purple'}
     
     for method in methods:
         estimates_for_method = [estimates[method][target] for target in targets]
         plt.scatter(gt_probs[targets].cpu().numpy(), estimates_for_method, label=method, color=colors[method])
+
 
         zero_targets = list(filter(lambda target: estimates[method][target] == 0, targets))
         if zero_targets:
