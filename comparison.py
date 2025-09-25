@@ -12,19 +12,19 @@ from lpe.utils import Transformer
 from lpe.utils import datasets as lpe_datasets
 
 
+
 def COLD(
     model,
     input_dists,
     target: int,
     temp: float = 1.0,
-    n_samples: int = 1024,
-    n_iterations: int = 200, 
+    n_samples: int = 2**13,
+    n_iterations: int = 300, 
     stepsize: float = 0.1,
     noise_schedule: Optional[List[float]] = None,
     noise_schedule_iters: Optional[List[int]] = None,
     fluency_weight: float = 0.5,
     target_weight: float = 0.5,
-    topk: int = 5,
     batch_size: int = 64, 
     device: Optional[str] = None
 ) -> float:
@@ -32,19 +32,22 @@ def COLD(
         device = model.device
         
     if noise_schedule is None:
-        noise_schedule = [1.0, 0.5, 0.1, 0.05, 0.01]
+        noise_schedule = [0.5, 0.3, 0.1, 0.05, 0.01]
     if noise_schedule_iters is None:
-        noise_schedule_iters = [0, 40, 80, 120, 160]  
+        noise_schedule_iters = [0, 50, 100, 150, 180]  #try edit and figure difference
     
     vocab_size = model.embed.d_vocab
     
-    all_estimates = []
+    # Step 1: Optimize particles to find good sampling distribution
+    all_importance_estimates = []
     n_batches = (n_samples + batch_size - 1) // batch_size
+    
+    adaptive_stepsize = stepsize / np.sqrt(batch_size)
     
     for batch_idx in tqdm(range(n_batches), desc="COLD batches"):
         current_batch_size = min(batch_size, n_samples - batch_idx * batch_size)
         
-       
+        # Sample contexts
         contexts = []
         for _ in range(current_batch_size):
             context = []
@@ -58,18 +61,61 @@ def COLD(
         
         contexts = torch.stack(contexts) 
         
+        # Initialize particles
+        particles = torch.randn(current_batch_size, vocab_size, device=device) * 0.1
         
-        particles = torch.randn(current_batch_size, vocab_size, device=device) * temp
-        
-       
+        # Get model predictions for this context
         with torch.no_grad():
-            x = model.embed(contexts)
+            # Debug the contexts shape
+            if batch_idx == 0:
+                print(f"Debug - contexts.shape: {contexts.shape}")
+            
+            x = model.embed(contexts)  # Should be [current_batch_size, seq_len, d_model]
             x = x + model.pos_embed(contexts)
             for block in model.blocks:
                 x = block(x)
             x = model.ln_final(x)
-            model_logits = model.unembed(x[:, -1, :])
-            model_probs = F.softmax(model_logits / temp, dim=-1)
+            
+            # Debug intermediate shapes
+            if batch_idx == 0:
+                print(f"Debug - x.shape after ln_final: {x.shape}")
+            
+            last_token_repr = x[:, -1, :]  # Shape: [current_batch_size, d_model]
+            
+            if batch_idx == 0:
+                print(f"Debug - last_token_repr.shape: {last_token_repr.shape}")
+            
+            model_logits = model.unembed(last_token_repr)  # Should be [current_batch_size, vocab_size]
+            
+            if batch_idx == 0:
+                print(f"Debug - model_logits.shape before processing: {model_logits.shape}")
+            
+            if model_logits.dim() == 3:
+                print(f"Debug - model_logits is 3D, shape: {model_logits.shape}")
+                # The unembed layer is returning [1, batch_size, vocab_size] instead of [batch_size, vocab_size]
+                # We need to squeeze the first dimension and transpose
+                model_logits = model_logits.squeeze(0)  # Remove the spurious batch dimension
+                print(f"Debug - model_logits after squeeze: {model_logits.shape}")
+                
+                # Now model_logits should be [batch_size, vocab_size] = [32, 48262]
+                # But if it's still [32, 48262] where 32 is treated as sequence length, we might need to transpose
+                if model_logits.shape[0] == current_batch_size and model_logits.shape[1] == vocab_size:
+                    # This is correct: [batch_size, vocab_size]
+                    pass
+                elif model_logits.shape[0] == vocab_size and model_logits.shape[1] == current_batch_size:
+                    # Need to transpose: [vocab_size, batch_size] -> [batch_size, vocab_size]  
+                    model_logits = model_logits.transpose(0, 1)
+                    print(f"Debug - model_logits after transpose: {model_logits.shape}")
+                elif model_logits.shape[1] == vocab_size:
+                    # It's [32, 48262] which is [batch_size, vocab_size] - correct!
+                    pass
+                else:
+                    print(f"Debug - unexpected model_logits shape: {model_logits.shape}")
+                
+            if batch_idx == 0:
+                print(f"Debug - model_logits.shape after processing: {model_logits.shape}")
+                
+            model_probs = F.softmax(model_logits / temp, dim=-1)  # Should be [current_batch_size, vocab_size]
         
         def get_noise_std(iteration: int) -> float:
             for i, iter_thresh in enumerate(noise_schedule_iters):
@@ -78,64 +124,99 @@ def COLD(
             return noise_schedule[-1]
         
         def energy_function(particles: torch.Tensor) -> torch.Tensor:
-            
-            
             particle_probs = F.softmax(particles / temp, dim=-1)
             
-           
-            fluency_loss = F.kl_div(
+            # Energy should encourage high target probability while staying somewhat reasonable
+            target_logprobs = F.log_softmax(particles / temp, dim=-1)[:, target]
+            target_energy = -target_logprobs  # Lower energy when target prob is higher
+            
+            # Regularization to prevent completely unrealistic distributions
+            fluency_penalty = F.kl_div(
                 particle_probs.log(), 
                 model_probs, 
                 reduction='none'
             ).sum(-1)
             
-            
-            target_logprobs = F.log_softmax(particles, dim=-1)[:, target]
-            target_loss = -target_logprobs
-            
-            return fluency_weight * fluency_loss + target_weight * target_loss
+            return target_energy + fluency_weight * fluency_penalty
         
-       
+        # Optimize particles to find good sampling distribution
         for iteration in range(n_iterations):
             noise_std = get_noise_std(iteration)
             
             particles = particles.detach().requires_grad_(True)
             
             energy = energy_function(particles)
-            energy_total = energy.sum()
+            energy_mean = energy.mean()
             
-           
-            energy_total.backward()
+            energy_mean.backward()
             gradients = particles.grad.clone()
             
-           
             with torch.no_grad():
                 noise = torch.randn_like(particles) * noise_std
-                particles = particles - stepsize * gradients + noise
+                particles = particles - adaptive_stepsize * gradients + noise
+                particles = torch.clamp(particles, -5*temp, 5*temp)
             
-           
             particles.grad = None
             
-           
             if iteration % 20 == 0:
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
- 
+        # Step 2: Sample from optimized distribution and compute estimates
         with torch.no_grad():
-            final_probs = F.softmax(particles / temp, dim=-1)
-            target_probs = final_probs[:, target]
-            batch_estimate = target_probs.mean().item()
-            all_estimates.append(batch_estimate)
+            # Get final optimized distribution q(x) 
+            q_logits = particles.detach()
+            q_probs = F.softmax(q_logits / temp, dim=-1)
+            
+            # Debug shapes
+            if batch_idx == 0:
+                print(f"Debug - current_batch_size: {current_batch_size}")
+                print(f"Debug - model_probs.shape: {model_probs.shape}")
+                print(f"Debug - q_probs.shape: {q_probs.shape}")
+            
+            # For each context in this batch, sample multiple times from the optimized distribution
+            n_samples_per_context = 10  # Sample multiple times per optimized distribution
+            batch_estimates = []
+            
+            for context_idx in range(current_batch_size):
+                context_estimates = []
+                
+                for _ in range(n_samples_per_context):
+                    # Sample a token from the optimized distribution q
+                    sampled_token = torch.multinomial(q_probs[context_idx], 1).item()
+                    
+                    # Get the original model probability for this context-token pair
+                    p_prob = model_probs[context_idx, sampled_token].item()
+                    q_prob = q_probs[context_idx, sampled_token].item()
+                    
+                    if q_prob > 1e-10:  # Avoid division by zero
+                        # Importance sampling: weight by p/q
+                        importance_weight = p_prob / q_prob
+                        
+                        # Indicator: 1 if we sampled the target, 0 otherwise  
+                        indicator = 1.0 if sampled_token == target else 0.0
+                        
+                        # The estimate for this sample
+                        sample_estimate = importance_weight * indicator
+                        context_estimates.append(sample_estimate)
+                    else:
+                        context_estimates.append(0.0)
+                
+                # Average estimates for this context
+                if context_estimates:
+                    batch_estimates.append(np.mean(context_estimates))
+            
+            all_importance_estimates.extend(batch_estimates)
         
-       
+        # Cleanup
         del particles, contexts, model_probs, model_logits
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-   
-    return np.mean(all_estimates)
-
-
-
+    # Final importance sampling estimate
+    if all_importance_estimates:
+        return np.mean(all_importance_estimates)
+    else:
+        return 0.0
+        
 def run_lpe_with_cold():
     """Example usage following the LPE framework pattern"""
     
@@ -170,8 +251,8 @@ def run_lpe_with_cold():
                     orig_dists, 
                     target, 
                     temp=RECOMMENDED_TEMPS[model_name].get("COLD", {}).get(dist_name, 1.0),
-                    n_samples=512, 
-                    n_iterations=100,  
+                    n_samples=2**13, 
+                    n_iterations=300,  
                     batch_size=32  
                 )
 
